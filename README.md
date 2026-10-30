@@ -50,6 +50,7 @@ Always drive the latent from the compile node's `width` and `height`. A layout i
 | --- | --- |
 | `llm_output` (input) | The LLM's reply. Code fences and text around the JSON are ignored. |
 | `caption_width`, `caption_height` (input) | The fallback canvas: used for captions and for layouts that leave out width or height. Set them to the System Prompt node's size. For Qwen-Image-PE output, they set the pixel budget. |
+| `strict` (optional input) | Off by default. Off: the node repairs the draft instead of failing (see Troubleshooting). On: any draft that is not exactly valid is rejected. |
 | `prompt` (output) | The caption text, or the compiled one-line layout JSON. |
 | `width`, `height` (outputs) | The size to generate at. |
 | `draft` (output) | The parsed draft, pretty-printed for inspection. |
@@ -77,18 +78,26 @@ From the [MOSS-Image user guide](https://github.com/OpenMOSS/MOSS-Image/blob/mai
 
 ## Troubleshooting
 
-The compile node fixes these slips without being asked:
+By default (`strict` off) the compile node repairs the draft and prints each repair to the console as `MOSS Compile Prompt: ...`:
 
 - A top-level `caption` beside a layout moves into `summary.caption`, or is dropped if that is already set.
 - A layout wrapped in `layout`, `draft`, `result` or `output` is unwrapped.
 - A missing `width` or `height` falls back to `caption_width` and `caption_height`. A missing `bbox_coord_space` or `bbox_format` becomes `abs` or `xyxy`.
 - Invented labels are mapped. Words such as `creature`, `person` or `animal` become `character`. Anything with a `text` field becomes `text`. Everything else becomes `object`.
+- A width or height that is not a multiple of 16 is snapped to the nearest multiple, and the boxes are scaled with it. `ImageResizeKJv2` rounds to 8 by default, so set its `divisible_by` to 16 or the sizes get snapped.
+- Boxes that fall outside the canvas are clamped to it.
+- A duplicate JSON key keeps its first value.
+- Unknown fields are removed. Items without a caption or a usable box are dropped. A `text` item with no `text` becomes an `object`.
+- If no usable items are left, the caption is used as the prompt.
 
-It never clips or moves a box. Anything else it can't fix stops the run with an error:
+Always take `width` and `height` from the compile node, since it may have changed them.
+
+With `strict` on, none of that happens and the node stops with an error:
 
 | Error | Fix |
 | --- | --- |
 | `LLM output is not valid JSON` | The reply was cut off. Raise the LLM's `max_length` or output limit. |
+| `Duplicate JSON key` | The LLM repeated a key. Rerun with a new seed. |
 | `bbox exceeds the WxH canvas` | Boxes don't fit the canvas. Check that both nodes use the same size, then rerun with a new seed. |
 | `width must be a positive integer multiple of 16` | Use a size divisible by 16. |
 | `text items require literal text` | A text item has no `text`. Rerun with a new seed. |

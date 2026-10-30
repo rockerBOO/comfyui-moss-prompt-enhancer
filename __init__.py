@@ -7,10 +7,11 @@ Wiring:  [MOSS Enhancer System Prompt] -> system_prompt of any LLM node
 """
 
 import json
+import math
 import os
 import re
 
-from .compile_prompt import compile_prompt, reject_constant, unique_object
+from .compile_prompt import centered_box, compile_prompt, reject_constant, unique_object
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -66,8 +67,18 @@ class MOSSEnhancerSystemPrompt:
         return (text,)
 
 
-def _extract_json(raw):
-    """Pull the JSON object out of an LLM reply (tolerates code fences / chatter)."""
+def _first_wins(pairs):
+    result = {}
+    for key, value in pairs:
+        result.setdefault(key, value)
+    return result
+
+
+def _extract_json(raw, strict=False):
+    """Pull the JSON object out of an LLM reply (tolerates code fences / chatter).
+
+    Relaxed mode keeps the first value of a duplicated key; strict mode rejects it.
+    """
     s = raw.strip()
     fence = re.search(r"```(?:json)?\s*(.*?)```", s, re.S)
     if fence:
@@ -76,7 +87,7 @@ def _extract_json(raw):
     if start < 0:
         raise ValueError("LLM output contains no JSON object:\n" + raw[:500])
     try:
-        obj, _ = json.JSONDecoder(object_pairs_hook=unique_object,
+        obj, _ = json.JSONDecoder(object_pairs_hook=unique_object if strict else _first_wins,
                                   parse_constant=reject_constant).raw_decode(s[start:])
     except json.JSONDecodeError as e:
         raise ValueError(
@@ -158,6 +169,70 @@ def _ratio_to_size(ratio, area=1024 * 1024):
     return w, h
 
 
+def _text_list(value):
+    return [v for v in value if isinstance(v, str) and v.strip()] if isinstance(value, list) else []
+
+
+def _repair_layout(draft, warnings):
+    """Make a layout draft acceptable to compile_prompt by dropping or fixing what is wrong.
+
+    Returns the repaired draft, or None if no usable items are left.
+    Each repair is appended to warnings.
+    """
+    width, height = draft["width"], draft["height"]
+    if not (isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0):
+        return None
+    new_w, new_h = max(16, round(width / 16) * 16), max(16, round(height / 16) * 16)
+    if (new_w, new_h) != (width, height):
+        warnings.append(f"size {width}x{height} is not a multiple of 16, using {new_w}x{new_h}")
+    sx, sy = new_w / width, new_h / height
+
+    items = []
+    for i, item in enumerate(draft.get("items") or []):
+        box = item.get("bbox") if isinstance(item, dict) else None
+        caption = item.get("caption") if isinstance(item, dict) else None
+        if (not isinstance(box, list) or len(box) != 4 or not all(type(v) in (int, float) and math.isfinite(v) for v in box)
+                or not isinstance(caption, str) or not caption.strip()):
+            warnings.append(f"dropped items[{i}]: needs a caption and a bbox of four numbers")
+            continue
+        x1, y1, x2, y2 = box[0] * sx, box[1] * sy, box[2] * sx, box[3] * sy
+        x1, x2 = sorted((min(max(x1, 0), new_w), min(max(x2, 0), new_w)))
+        y1, y2 = sorted((min(max(y1, 0), new_h), min(max(y2, 0), new_h)))
+        fixed = {"label": item["label"], "caption": caption, "bbox": [x1, y1, x2, y2]}
+        if not all(math.isclose(a, b, abs_tol=1e-6) for a, b in zip(fixed["bbox"], (box[0] * sx, box[1] * sy, box[2] * sx, box[3] * sy))):
+            warnings.append(f"items[{i}]: bbox moved inside the canvas")
+        if isinstance(item.get("text"), str) and item["text"].strip():
+            fixed["text"] = item["text"]
+        elif fixed["label"] == "text":
+            fixed["label"] = "object"
+            warnings.append(f"items[{i}]: text item has no text, treated as object")
+        for key in ("tags", "palette"):
+            if _text_list(item.get(key)):
+                fixed[key] = _text_list(item[key])
+        try:
+            centered_box(fixed["bbox"], new_w, new_h, f"items[{i}].bbox")
+        except ValueError as e:
+            warnings.append(f"dropped items[{i}]: {e}")
+            continue
+        extra = item.keys() - fixed.keys() - {"text", "tags", "palette"}
+        if extra:
+            warnings.append(f"items[{i}]: removed unknown fields {sorted(extra)}")
+        items.append(fixed)
+    if not items:
+        return None
+
+    summary = draft.get("summary")
+    summary = summary if isinstance(summary, dict) else {}
+    fixed_summary = {"caption": summary.get("caption") if isinstance(summary.get("caption"), str) and summary["caption"].strip() else items[0]["caption"]}
+    if summary.get("canvas") in ("single", "multi_panel", "collage"):
+        fixed_summary["canvas"] = summary["canvas"]
+    for key in ("meta", "palette"):
+        if _text_list(summary.get(key)):
+            fixed_summary[key] = _text_list(summary[key])
+    return {"width": new_w, "height": new_h, "bbox_coord_space": "abs", "bbox_format": "xyxy",
+            "summary": fixed_summary, "items": items}
+
+
 class MOSSCompilePrompt:
     @classmethod
     def INPUT_TYPES(cls):
@@ -167,7 +242,11 @@ class MOSSCompilePrompt:
                 "caption_width": ("INT", {"default": 1024, "min": 16, "max": 16384, "step": 16,
                                   "tooltip": "Fallback canvas size: used for captions, and for layouts where the LLM left out width/height (set it to the same size as the System Prompt node). For Qwen-PE output, width x height sets the pixel budget and wh_ratio sets the shape."}),
                 "caption_height": ("INT", {"default": 1024, "min": 16, "max": 16384, "step": 16}),
-            }
+            },
+            "optional": {
+                "strict": ("BOOLEAN", {"default": False,
+                           "tooltip": "Off: fix or drop what is wrong in the draft (sizes snapped to 16, boxes clamped to the canvas, bad items removed, caption used if no layout is left) and print each repair. On: reject any draft that is not exactly valid."}),
+            },
         }
 
     RETURN_TYPES = ("STRING", "INT", "INT", "STRING")
@@ -175,8 +254,8 @@ class MOSSCompilePrompt:
     FUNCTION = "compile"
     CATEGORY = "MOSS-Image/prompt enhancer"
 
-    def compile(self, llm_output, caption_width, caption_height):
-        draft = _extract_json(llm_output)
+    def compile(self, llm_output, caption_width, caption_height, strict=False):
+        draft = _extract_json(llm_output, strict)
         # Qwen-Image-2.1-PE-T2I output: {"rewritten_prompt": "...", "wh_ratio": "16:9"}
         if "rewritten_prompt" in draft:
             prompt = draft["rewritten_prompt"]
@@ -187,7 +266,21 @@ class MOSSCompilePrompt:
             else:
                 w, h = caption_width, caption_height
             return (prompt, w, h, json.dumps(draft, ensure_ascii=False, indent=2))
+        caption = draft.get("caption")
         draft = _normalize_layout(draft, caption_width, caption_height)
+        if not strict and "caption" not in draft:
+            warnings = []
+            repaired = _repair_layout(draft, warnings) if isinstance(draft.get("items"), list) else None
+            if repaired is None:
+                caption = caption if isinstance(caption, str) and caption.strip() else (draft.get("summary") or {}).get("caption")
+                if not isinstance(caption, str) or not caption.strip():
+                    raise ValueError("MOSS draft has no usable layout items or caption. Re-run the LLM (new seed).")
+                warnings.append("no usable layout, using the caption only")
+                draft = {"caption": caption}
+            else:
+                draft = repaired
+            for w in warnings:
+                print(f"MOSS Compile Prompt: {w}")
         try:
             prompt = compile_prompt(draft)
         except ValueError as e:
