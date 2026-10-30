@@ -34,6 +34,8 @@ your idea ───────────────────────�
 
 Always drive the latent from the compile node's `width` and `height`. A layout is only correct at the size it was planned for.
 
+To start from a working graph, open `example_workflows/moss_prompt_enhancer_t2i.json` (also under Workflow > Browse Templates). Pick your own UNet, text encoder and VAE in the loader nodes, write your idea, and run it.
+
 ## Nodes
 
 **MOSS Enhancer System Prompt** builds the system prompt for the LLM.
